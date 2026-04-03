@@ -81,6 +81,19 @@
         </li>
 
         <li>
+          <a class="menu-item" href="/scraper" rel="noopener">
+            <span class="mi" aria-hidden="true">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor"
+                stroke-width="1.5" aria-hidden="true" focusable="false">
+                <path stroke-linecap="round" stroke-linejoin="round"
+                  d="m21 21-5.197-5.197m0 0A7.5 7.5 0 1 0 5.196 5.196a7.5 7.5 0 0 0 10.607 10.607Z" />
+              </svg>
+            </span>
+            <span class="mi-label">Scraper</span>
+          </a>
+        </li>
+
+        <li>
           <a class="menu-item" href="/system" rel="noopener">
             <span class="mi" aria-hidden="true">
               <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor"
@@ -90,6 +103,19 @@
               </svg>
             </span>
             <span class="mi-label">System</span>
+          </a>
+        </li>
+
+        <li>
+          <a class="menu-item" href="/event-logs" rel="noopener">
+            <span class="mi" aria-hidden="true">
+              <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor"
+                stroke-width="1.5" aria-hidden="true" focusable="false">
+                <path stroke-linecap="round" stroke-linejoin="round"
+                  d="M12 6v6h4.5m4.5 0a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z" />
+              </svg>
+            </span>
+            <span class="mi-label">Logs</span>
           </a>
         </li>
 
@@ -217,6 +243,7 @@
     freely edit them in the clone.",
     "MIRROR_ROLE_PERMISSIONS": "When enabled, mirror role permissions from the host to the clone.",
     "EDIT_MESSAGES": "Messages that are edited in the host will be edited in the clone.",
+    "RESEND_EDITED_MESSAGES": "When enabled, if a message edited in the host does not exist in the clone, it will be resent as a new message. Requires EDIT_MESSAGES to be enabled.",
     "DELETE_MESSAGES": "Messages that are deleted in the host will be deleted in the clone.",
     "DELETE_THREADS": "When enabled, delete in the clone any threads that were removed in the host.",
     "DELETE_CHANNELS": "When enabled, delete in the clone any channels that were removed in the host.",
@@ -386,6 +413,41 @@
 
       <div id="guild-mapping-list" class="guild-mapping-list"></div>
     </div>
+
+    <!-- ─── Server Proxy Rotation ─── -->
+    <details class="card srv-proxy-card" id="srv-proxy-card">
+      <summary class="srv-proxy-summary">
+        <h3>Proxy Rotation</h3>
+        <span class="srv-proxy-status" id="srv-proxy-status"></span>
+        <span class="srv-proxy-count" id="srv-proxy-count"></span>
+      </summary>
+      <div class="srv-proxy-body">
+        <div class="srv-proxy-toggle-row">
+          <label class="srv-proxy-toggle-label" for="srv-proxy-toggle">
+            <input type="checkbox" id="srv-proxy-toggle" />
+            <span>Enable proxy rotation for structure sync</span>
+          </label>
+        </div>
+        <p class="srv-proxy-hint">
+          When enabled, every Discord API call during structure sync
+          (channel create, webhook create, guild edit, etc.) is routed through a
+          rotating proxy and rate limiting is bypassed — syncs complete much faster.<br>
+          Paste one proxy per line. Examples:
+          <code>host:port</code>, <code>host:port:user:pass</code>,
+          <code>user:pass@host:port</code>
+        </p>
+        <textarea class="input srv-proxy-textarea" id="srv-proxy-textarea"
+                  placeholder="82.27.104.216:25208:user:pass&#10;1.2.3.4:8080&#10;user:pass@5.6.7.8:3128"
+                  rows="5" spellcheck="false"></textarea>
+        <div class="srv-proxy-actions">
+          <button class="btn btn-primary btn-xs" id="srv-proxy-save" type="button">Save</button>
+          <button class="btn btn-ghost btn-xs" id="srv-proxy-clear" type="button">Clear</button>
+          <span class="srv-proxy-separator"></span>
+          <button class="btn btn-outline btn-xs" id="srv-proxy-prepend-http" type="button">+ http://</button>
+          <button class="btn btn-outline btn-xs" id="srv-proxy-prepend-socks5" type="button">+ socks5://</button>
+        </div>
+      </div>
+    </details>
 
     <div id="log-modal" class="modal" aria-hidden="true">
       <div class="modal-backdrop"></div>
@@ -727,6 +789,35 @@
             </fieldset>
           </div>
 
+          <fieldset class="filters-col filters-channel-names">
+            <legend>Channel Name Blacklist</legend>
+
+            <div class="field">
+              <label for="channel_name_blacklist_input" class="has-tip">
+                <span class="label-text">Blocked Channel Name Patterns</span>
+                <button type="button" class="info-dot"
+                  aria-label="Channels matching these patterns will not be cloned."
+                  aria-describedby="tip-channel_name_blacklist"></button>
+                <span id="tip-channel_name_blacklist" role="tooltip" class="tip-bubble">
+                  Channels whose name matches a pattern will be skipped during
+                  cloning and messages will not be forwarded. Supports wildcards:
+                  * matches any characters, ? matches one character.
+                  Plain text uses substring matching.
+                  Examples: ticket-*, *-ticket, *-log-*
+                </span>
+              </label>
+
+              <div class="chips" data-chips="channel_name_blacklist">
+                <span class="chip-input-wrap">
+                  <input class="chip-input" id="channel_name_blacklist_input" type="text" inputmode="text"
+                    placeholder="Add pattern… e.g. ticket-*" />
+                </span>
+              </div>
+
+              <input type="hidden" id="channel_name_blacklist" name="channel_name_blacklist" value="">
+            </div>
+          </fieldset>
+
           <fieldset class="filters-col filters-roles">
             <legend>Role Blocks</legend>
 
@@ -957,17 +1048,8 @@
       <div class="footer-bar">
         <span class="footer-brand" aria-label="Copycord version {{ version or 'dev' }}">
           <span class="brand-name">Copycord</span>
-          <span class="brand-sep" aria-hidden="true"></span>
-          <bdi class="brand-version" id="footer-version">
-            {% if version %}
-            <a id="footer-version-link" href="{{ links.github }}/releases/tag/{{ version }}" target="_blank"
-              rel="noopener" class="footer-link" data-default-href="{{ links.github }}/releases/tag/{{ version }}">
-              {{ version }}
-            </a>
-            {% else %}
-            <span id="footer-version-text">dev</span>
-            {% endif %}
-          </bdi>
+          <span class="brand-sep" aria-hidden="true">&middot;</span>
+          <bdi class="brand-version" id="footer-version">{% if version %}<a id="footer-version-link" href="{{ links.github }}/releases/tag/{{ version }}" target="_blank" rel="noopener" class="footer-link" data-default-href="{{ links.github }}/releases/tag/{{ version }}">{{ version }}</a>{% else %}<span id="footer-version-text">dev</span>{% endif %}</bdi>
         </span>
 
         <div class="footer-links" role="group" aria-label="Links">

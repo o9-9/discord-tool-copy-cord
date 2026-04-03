@@ -7,9 +7,11 @@
 #  https://www.gnu.org/licenses/agpl-3.0.en.html
 # =============================================================================
 
+
 from datetime import datetime
 import json
 import sqlite3, threading
+import time
 from typing import Dict, List, Optional
 import uuid
 import secrets
@@ -458,6 +460,35 @@ class DBManager:
         )
 
         self._ensure_table(
+            name="channel_name_blacklist",
+            create_sql_template="""
+                CREATE TABLE {table} (
+                    pattern            TEXT NOT NULL,
+                    original_guild_id  INTEGER,
+                    cloned_guild_id    INTEGER,
+                    added_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (pattern, original_guild_id, cloned_guild_id)
+                )
+            """,
+            required_columns={
+                "pattern",
+                "original_guild_id",
+                "cloned_guild_id",
+                "added_at",
+            },
+            copy_map={
+                "pattern": "pattern",
+                "original_guild_id": "original_guild_id",
+                "cloned_guild_id": "cloned_guild_id",
+                "added_at": "COALESCE(added_at, CURRENT_TIMESTAMP)",
+            },
+            post_sql=[
+                "CREATE INDEX IF NOT EXISTS idx_chan_bl_orig ON channel_name_blacklist(original_guild_id)",
+                "CREATE INDEX IF NOT EXISTS idx_chan_bl_clone ON channel_name_blacklist(cloned_guild_id)",
+            ],
+        )
+
+        self._ensure_table(
             name="announcement_subscriptions",
             create_sql_template="""
                 CREATE TABLE {table} (
@@ -902,6 +933,7 @@ class DBManager:
                 "CREATE INDEX IF NOT EXISTS idx_forwarding_events_rule ON forwarding_events(rule_id);",
                 "CREATE INDEX IF NOT EXISTS idx_forwarding_events_guild ON forwarding_events(guild_id);",
                 "CREATE INDEX IF NOT EXISTS idx_forwarding_events_created ON forwarding_events(created_at);",
+                "CREATE INDEX IF NOT EXISTS idx_forwarding_events_rule_msg ON forwarding_events(rule_id, source_message_id);",
             ],
         )
         self._ensure_table(
@@ -931,6 +963,102 @@ class DBManager:
             },
             post_sql=[
                 "CREATE INDEX IF NOT EXISTS idx_backup_added ON backup_tokens(added_at);",
+            ],
+        )
+
+        self._ensure_table(
+            name="scraper_tokens",
+            create_sql_template="""
+                CREATE TABLE {table} (
+                    token_id        TEXT PRIMARY KEY,
+                    token_value     TEXT NOT NULL UNIQUE,
+                    label           TEXT,
+                    is_valid        INTEGER DEFAULT 0,
+                    last_validated  INTEGER,
+                    username        TEXT,
+                    user_id         TEXT,
+                    added_at        INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)),
+                    last_used       INTEGER,
+                    use_count       INTEGER DEFAULT 0
+                );
+            """,
+            required_columns={
+                "token_id",
+                "token_value",
+                "label",
+                "is_valid",
+                "last_validated",
+                "username",
+                "user_id",
+                "added_at",
+                "last_used",
+                "use_count",
+            },
+            copy_map={
+                "token_id": "token_id",
+                "token_value": "token_value",
+                "label": "label",
+                "is_valid": "is_valid",
+                "last_validated": "last_validated",
+                "username": "username",
+                "user_id": "user_id",
+                "added_at": "added_at",
+                "last_used": "last_used",
+                "use_count": "use_count",
+            },
+            post_sql=[
+                "CREATE INDEX IF NOT EXISTS idx_scraper_tokens_valid ON scraper_tokens(is_valid);",
+                "CREATE INDEX IF NOT EXISTS idx_scraper_tokens_added ON scraper_tokens(added_at);",
+            ],
+        )
+
+        self._ensure_table(
+            name="event_logs",
+            create_sql_template="""
+                CREATE TABLE {table} (
+                    log_id          TEXT PRIMARY KEY,
+                    event_type      TEXT NOT NULL,
+                    guild_id        INTEGER,
+                    guild_name      TEXT,
+                    channel_id      INTEGER,
+                    channel_name    TEXT,
+                    category_id     INTEGER,
+                    category_name   TEXT,
+                    details         TEXT NOT NULL DEFAULT '',
+                    extra_json      TEXT,
+                    created_at      INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
+                );
+            """,
+            required_columns={
+                "log_id",
+                "event_type",
+                "guild_id",
+                "guild_name",
+                "channel_id",
+                "channel_name",
+                "category_id",
+                "category_name",
+                "details",
+                "extra_json",
+                "created_at",
+            },
+            copy_map={
+                "log_id": "log_id",
+                "event_type": "event_type",
+                "guild_id": "guild_id",
+                "guild_name": "guild_name",
+                "channel_id": "channel_id",
+                "channel_name": "channel_name",
+                "category_id": "category_id",
+                "category_name": "category_name",
+                "details": "details",
+                "extra_json": "extra_json",
+                "created_at": "created_at",
+            },
+            post_sql=[
+                "CREATE INDEX IF NOT EXISTS idx_event_logs_type ON event_logs(event_type);",
+                "CREATE INDEX IF NOT EXISTS idx_event_logs_guild ON event_logs(guild_id);",
+                "CREATE INDEX IF NOT EXISTS idx_event_logs_created ON event_logs(created_at);",
             ],
         )
 
@@ -3545,6 +3673,69 @@ class DBManager:
                     (w, host_gid, clone_gid),
                 )
 
+    def get_channel_name_blacklist_for_mapping(
+        self, original_guild_id: int, cloned_guild_id: int
+    ) -> list[str]:
+        rows = self.conn.execute(
+            """
+            SELECT pattern
+            FROM channel_name_blacklist
+            WHERE original_guild_id=? AND cloned_guild_id=?
+            ORDER BY pattern COLLATE NOCASE ASC
+            """,
+            (int(original_guild_id), int(cloned_guild_id)),
+        ).fetchall()
+        return [
+            str(r["pattern"]).strip()
+            for r in rows
+            if str(r["pattern"]).strip()
+        ]
+
+    def replace_channel_name_blacklist_for_mapping(
+        self,
+        mapping_id: str,
+        patterns: list[str],
+    ) -> None:
+        if not mapping_id:
+            return
+
+        mapping_row = self.get_mapping_by_id(mapping_id)
+        if not mapping_row:
+            return
+
+        host_gid = int(mapping_row["original_guild_id"])
+        clone_gid = int(mapping_row["cloned_guild_id"])
+
+        cleaned: list[str] = []
+        for p in patterns or []:
+            p2 = (p or "").strip()
+            if not p2:
+                continue
+            if p2 not in cleaned:
+                cleaned.append(p2)
+
+        with self.conn:
+            self.conn.execute(
+                """
+                DELETE FROM channel_name_blacklist
+                WHERE original_guild_id=? AND cloned_guild_id=?
+                """,
+                (host_gid, clone_gid),
+            )
+
+            for p in cleaned:
+                self.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO channel_name_blacklist
+                    (pattern, original_guild_id, cloned_guild_id, added_at)
+                    VALUES (
+                        ?, ?, ?,
+                        strftime('%Y-%m-%d %H:%M:%S','now')
+                    )
+                    """,
+                    (p, host_gid, clone_gid),
+                )
+
     def get_clone_guild_ids_for_origin(self, original_guild_id: int) -> list[int]:
         rows = self.conn.execute(
             """
@@ -4853,6 +5044,20 @@ class DBManager:
             )
         return eid
 
+    def has_forwarding_event(
+        self,
+        *,
+        rule_id: str,
+        source_message_id: int,
+    ) -> bool:
+        """Check whether a forwarding event already exists for this rule + message."""
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM forwarding_events WHERE rule_id=? AND source_message_id=? LIMIT 1",
+                (rule_id, int(source_message_id)),
+            ).fetchone()
+        return row is not None
+
     def count_forwarded_messages(self) -> int:
         """
         Total number of forwarded messages recorded (each sent payload counted once).
@@ -4916,6 +5121,266 @@ class DBManager:
             """
         )
         return [dict(row) for row in cur.fetchall()]
+
+    def add_scraper_token(self, token_value: str, label: str = None) -> str:
+        """Add a new scraper token and return its token_id."""
+        token_id = str(uuid.uuid4())
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT INTO scraper_tokens (token_id, token_value, label)
+                VALUES (?, ?, ?)
+                """,
+                (token_id, token_value, label),
+            )
+            self.conn.commit()
+        return token_id
+
+    def list_scraper_tokens(self) -> list[dict]:
+        """Return all scraper tokens with metadata."""
+        with self.lock:
+            cur = self.conn.execute(
+                """
+                SELECT token_id, token_value, label, is_valid, last_validated,
+                       username, user_id, added_at, last_used, use_count
+                FROM scraper_tokens
+                ORDER BY added_at DESC
+                """
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+    def get_scraper_token(self, token_id: str) -> dict | None:
+        """Get a single scraper token by ID."""
+        with self.lock:
+            cur = self.conn.execute(
+                """
+                SELECT token_id, token_value, label, is_valid, last_validated,
+                       username, user_id, added_at, last_used, use_count
+                FROM scraper_tokens
+                WHERE token_id = ?
+                """,
+                (token_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def update_scraper_token(
+        self,
+        token_id: str,
+        *,
+        label: str = None,
+        is_valid: bool = None,
+        username: str = None,
+        user_id: str = None,
+    ) -> bool:
+        """Update scraper token metadata."""
+        updates = []
+        params = []
+
+        if label is not None:
+            updates.append("label = ?")
+            params.append(label)
+        if is_valid is not None:
+            updates.append("is_valid = ?")
+            updates.append("last_validated = ?")
+            params.append(1 if is_valid else 0)
+            params.append(int(time.time()))
+        if username is not None:
+            updates.append("username = ?")
+            params.append(username)
+        if user_id is not None:
+            updates.append("user_id = ?")
+            params.append(user_id)
+
+        if not updates:
+            return False
+
+        params.append(token_id)
+
+        with self.lock:
+            self.conn.execute(
+                f"UPDATE scraper_tokens SET {', '.join(updates)} WHERE token_id = ?",
+                params,
+            )
+            self.conn.commit()
+        return True
+
+    def delete_scraper_token(self, token_id: str) -> bool:
+        """Delete a scraper token."""
+        with self.lock:
+            cur = self.conn.execute(
+                "DELETE FROM scraper_tokens WHERE token_id = ?", (token_id,)
+            )
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def increment_scraper_token_usage(self, token_id: str) -> None:
+        """Increment usage counter and update last_used timestamp."""
+        with self.lock:
+            self.conn.execute(
+                """
+                UPDATE scraper_tokens 
+                SET use_count = use_count + 1,
+                    last_used = ?
+                WHERE token_id = ?
+                """,
+                (int(time.time()), token_id),
+            )
+            self.conn.commit()
+
+    # ── event_logs CRUD ──────────────────────────────────────────────
+
+    def add_event_log(
+        self,
+        event_type: str,
+        details: str,
+        guild_id: Optional[int] = None,
+        guild_name: Optional[str] = None,
+        channel_id: Optional[int] = None,
+        channel_name: Optional[str] = None,
+        category_id: Optional[int] = None,
+        category_name: Optional[str] = None,
+        extra: Optional[dict] = None,
+    ) -> str:
+        """Insert a new event log entry and return its log_id."""
+        log_id = uuid.uuid4().hex[:12]
+        extra_json = json.dumps(extra, separators=(",", ":")) if extra else None
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT INTO event_logs
+                    (log_id, event_type, guild_id, guild_name, channel_id,
+                     channel_name, category_id, category_name, details, extra_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(strftime('%s','now') AS INTEGER))
+                """,
+                (
+                    log_id,
+                    event_type,
+                    guild_id,
+                    guild_name,
+                    channel_id,
+                    channel_name,
+                    category_id,
+                    category_name,
+                    details,
+                    extra_json,
+                ),
+            )
+            self.conn.commit()
+        return log_id
+
+    def get_event_logs(
+        self,
+        event_type: Optional[str] = None,
+        guild_id: Optional[int] = None,
+        search: Optional[str] = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> List[dict]:
+        """Return event logs filtered by optional type, guild, and search text."""
+        clauses = []
+        params: list = []
+
+        if event_type:
+            clauses.append("event_type = ?")
+            params.append(event_type)
+        if guild_id is not None:
+            clauses.append("guild_id = ?")
+            params.append(guild_id)
+        if search:
+            clauses.append(
+                "(details LIKE ? OR channel_name LIKE ? OR category_name LIKE ? OR guild_name LIKE ?)"
+            )
+            pat = f"%{search}%"
+            params.extend([pat, pat, pat, pat])
+
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = f"SELECT * FROM event_logs{where} ORDER BY created_at DESC, log_id DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+        with self.lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def count_event_logs(
+        self,
+        event_type: Optional[str] = None,
+        guild_id: Optional[int] = None,
+        search: Optional[str] = None,
+    ) -> int:
+        """Return total count matching the given filters."""
+        clauses = []
+        params: list = []
+
+        if event_type:
+            clauses.append("event_type = ?")
+            params.append(event_type)
+        if guild_id is not None:
+            clauses.append("guild_id = ?")
+            params.append(guild_id)
+        if search:
+            clauses.append(
+                "(details LIKE ? OR channel_name LIKE ? OR category_name LIKE ? OR guild_name LIKE ?)"
+            )
+            pat = f"%{search}%"
+            params.extend([pat, pat, pat, pat])
+
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = f"SELECT COUNT(*) FROM event_logs{where}"
+
+        with self.lock:
+            row = self.conn.execute(sql, params).fetchone()
+        return row[0] if row else 0
+
+    def get_event_log_types(self) -> List[str]:
+        """Return distinct event types present in the log."""
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT DISTINCT event_type FROM event_logs ORDER BY event_type"
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def delete_event_log(self, log_id: str) -> bool:
+        """Delete a single event log entry."""
+        with self.lock:
+            cur = self.conn.execute(
+                "DELETE FROM event_logs WHERE log_id = ?", (log_id,)
+            )
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def delete_event_logs_bulk(self, log_ids: List[str]) -> int:
+        """Delete multiple event log entries. Returns count deleted."""
+        if not log_ids:
+            return 0
+        placeholders = ",".join("?" for _ in log_ids)
+        with self.lock:
+            cur = self.conn.execute(
+                f"DELETE FROM event_logs WHERE log_id IN ({placeholders})",
+                log_ids,
+            )
+            self.conn.commit()
+            return cur.rowcount
+
+    def clear_event_logs(self) -> int:
+        """Delete all event log entries. Returns count deleted."""
+        with self.lock:
+            cur = self.conn.execute("DELETE FROM event_logs")
+            self.conn.commit()
+            return cur.rowcount
+
+    def get_valid_scraper_tokens(self) -> list[dict]:
+        """Return only validated scraper tokens."""
+        with self.lock:
+            cur = self.conn.execute(
+                """
+                SELECT token_id, token_value, label, username, user_id
+                FROM scraper_tokens
+                WHERE is_valid = 1
+                ORDER BY use_count ASC, added_at ASC
+                """
+            )
+            return [dict(row) for row in cur.fetchall()]
 
     def add_backup_token(self, token_value: str, note: Optional[str] = None) -> str:
         """Insert a new backup token and return its token_id."""

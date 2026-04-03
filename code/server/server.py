@@ -45,6 +45,7 @@ from common.websockets import WebsocketManager, AdminBus
 from common.db import DBManager
 from server.rate_limiter import RateLimitManager, ActionType
 from server.discord_hooks import install_discord_rl_probe
+from server.proxy_rotator import ProxyRotator, patch_discord_http
 from server.emojis import EmojiManager
 from server.stickers import StickerManager
 from server.roles import RoleManager
@@ -62,6 +63,7 @@ from server.helpers import (
 from server.permission_sync import ChannelPermissionSync
 from server.guild_resolver import GuildResolver
 from server import logctx
+from fnmatch import fnmatch as _fnmatch
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
@@ -100,6 +102,25 @@ for lib in (
 logging.getLogger("discord.client").setLevel(logging.ERROR)
 
 logger = logging.getLogger("server")
+
+
+def _channel_name_blacklisted(name: str, patterns: list[str]) -> bool:
+    """Check if a channel name matches any blacklist pattern (case-insensitive).
+
+    Supports fnmatch-style wildcards (* and ?).
+    Plain strings without wildcards use substring matching.
+    """
+    if not patterns or not name:
+        return False
+    name_lower = name.lower()
+    for p in patterns:
+        if "*" in p or "?" in p:
+            if _fnmatch(name_lower, p):
+                return True
+        else:
+            if p in name_lower:
+                return True
+    return False
 
 
 class _GuildPrefixFilter(logging.Filter):
@@ -153,6 +174,8 @@ class ServerReceiver:
             tuple[int, int], list[tuple[re.Pattern, str]]
         ] = {}
         self._blocked_keywords_lock = asyncio.Lock()
+        self._channel_name_blacklist_cache: dict[tuple[int, int], list[str]] = {}
+        self._channel_name_blacklist_lock = asyncio.Lock()
         self._user_filters_cache: dict[tuple[int, int], dict[str, set[int]]] = {}
         self._word_rewrites_cache: dict[
             tuple[int, int], list[tuple[re.Pattern, str]]
@@ -220,6 +243,7 @@ class ServerReceiver:
             ratelimit=self.ratelimit,
             session=self.session,
             guild_resolver=self.guild_resolver,
+            emit_event_log=self._emit_event_log,
         )
         self.stickers = StickerManager(
             bot=self.bot,
@@ -227,12 +251,14 @@ class ServerReceiver:
             ratelimit=self.ratelimit,
             session=self.session,
             guild_resolver=self.guild_resolver,
+            emit_event_log=self._emit_event_log,
         )
         self.roles = RoleManager(
             bot=self.bot,
             db=self.db,
             ratelimit=self.ratelimit,
             guild_resolver=self.guild_resolver,
+            emit_event_log=self._emit_event_log,
         )
         self.perms = ChannelPermissionSync(
             config=self.config,
@@ -241,9 +267,13 @@ class ServerReceiver:
             logger=logger.getChild("perm-sync"),
             ratelimit=self.ratelimit,
             rate_limiter_action=ActionType.EDIT_CHANNEL,
+            emit_event_log=self._emit_event_log,
         )
         self.onjoin = OnJoinService(self.bot, self.db, logger.getChild("OnJoin"))
         install_discord_rl_probe(self.ratelimit)
+
+        self.proxy_rotator = ProxyRotator()
+        self._init_proxy_rotator()
 
         self.MAX_GUILD_CHANNELS = 500
         self.MAX_CATEGORIES = 50
@@ -261,6 +291,20 @@ class ServerReceiver:
         self.bot.on_connect = _command_sync
         self.bot.load_extension("server.commands")
 
+    def _init_proxy_rotator(self) -> None:
+        """Load proxy list and check the ENABLE_SERVER_PROXIES db flag.
+
+        Proxies are loaded but kept **disabled** — they are only activated
+        for the duration of a ``sync_structure`` call so that login,
+        slash-command sync, message forwarding, etc. always go direct.
+        """
+        self.proxy_rotator.reload()
+        self._proxy_wanted = (
+            self.db.get_config("ENABLE_SERVER_PROXIES", "") or ""
+        ).strip().lower() in ("1", "true", "yes")
+
+        self.proxy_rotator.set_enabled(False)
+
     def _target_clone_gid_for_origin(self, host_guild_id: int | None) -> int | None:
         return self.guild_resolver.resolve_target_clone(host_guild_id=host_guild_id)
 
@@ -269,6 +313,46 @@ class ServerReceiver:
         if row is None:
             return None
         return row if isinstance(row, dict) else dict(row)
+
+    async def _emit_event_log(
+        self,
+        event_type: str,
+        details: str,
+        guild_id: int = None,
+        guild_name: str = None,
+        channel_id: int = None,
+        channel_name: str = None,
+        category_id: int = None,
+        category_name: str = None,
+        extra: dict = None,
+    ):
+        """Persist an event log entry and broadcast it to the admin UI."""
+        try:
+            log_id = self.db.add_event_log(
+                event_type=event_type,
+                details=details,
+                guild_id=guild_id,
+                guild_name=guild_name,
+                channel_id=channel_id,
+                channel_name=channel_name,
+                category_id=category_id,
+                category_name=category_name,
+                extra=extra,
+            )
+            await self.bus.publish("event_log", {
+                "log_id": log_id,
+                "event_type": event_type,
+                "details": details,
+                "guild_id": guild_id,
+                "guild_name": guild_name,
+                "channel_id": channel_id,
+                "channel_name": channel_name,
+                "category_id": category_id,
+                "category_name": category_name,
+                "extra": extra,
+            })
+        except Exception:
+            logger.debug("_emit_event_log failed", exc_info=True)
 
     async def _get_mappings_with_retry(
         self,
@@ -730,6 +814,7 @@ class ServerReceiver:
             self.verify.start()
         self._verify_task = asyncio.create_task(self._verify_listen_loop())
         await self._load_blocked_keywords_cache()
+        await self._load_channel_name_blacklist_cache()
         await self._load_user_filters_cache()
         await self._load_word_rewrites_cache()
         await self.bus.log("Boot completed")
@@ -738,6 +823,10 @@ class ServerReceiver:
         asyncio.create_task(self.config.setup_release_watcher(self))
         self.session = aiohttp.ClientSession()
         self.webhook_exporter = WebhookDMExporter(self.session, logger)
+
+        self._init_proxy_rotator()
+        patch_discord_http(self.bot, self.proxy_rotator)
+
         mapped = set(self.db.get_all_clone_guild_ids())
         present = (
             {g.id for g in self.bot.guilds} & mapped
@@ -1454,6 +1543,9 @@ class ServerReceiver:
 
             elif typ == "export_messages_done":
                 await self.webhook_exporter.handle_ws_export_messages_done(data)
+            elif typ == "reload_channel_name_blacklist":
+                await self._load_channel_name_blacklist_cache()
+                logger.info("[chan-blacklist] Cache reloaded from DB")
         finally:
             if token is not None:
                 logctx.guild_name.reset(token)
@@ -1632,6 +1724,15 @@ class ServerReceiver:
         """
         Synchronizes the structure of a clone based on the provided sitemap.
         """
+
+        self._init_proxy_rotator()
+        if self._proxy_wanted and self.proxy_rotator.count:
+            self.proxy_rotator.set_enabled(True)
+            self.ratelimit.set_proxy_bypass(True)
+            self.proxy_rotator.on_all_dead = (
+                lambda _rot: self.ratelimit.set_proxy_bypass(False)
+            )
+
         logger.debug(f"Sync Task #{task_id}: Processing sitemap {sitemap}")
 
         host_guild_id_raw = (sitemap.get("guild") or {}).get("id")
@@ -1791,9 +1892,12 @@ class ServerReceiver:
             main_summary = "; ".join(parts) if parts else "No structure changes needed"
 
             self._schedule_flush()
+
             return main_summary
 
         finally:
+            self.proxy_rotator.set_enabled(False)
+            self.ratelimit.set_proxy_bypass(False)
             logctx.sync_host_name.reset(_host_token)
             logctx.sync_display_id.reset(_id_token)
 
@@ -2056,6 +2160,12 @@ class ServerReceiver:
             )
             parts.append(
                 "Updated guild metadata: " + ", ".join(sorted(set(changed_fields)))
+            )
+            await self._emit_event_log(
+                "guild_metadata",
+                f"Updated guild metadata: {', '.join(sorted(set(changed_fields)))}",
+                guild_id=guild.id,
+                guild_name=guild.name,
             )
         except Exception:
             logger.warning(
@@ -2379,6 +2489,14 @@ class ServerReceiver:
                             orig_cat_id,
                             upstream_name,
                             int(cat_obj.id),
+                        )
+                        await self._emit_event_log(
+                            "category_created",
+                            f"Created category '{upstream_name or 'Category'}'",
+                            guild_id=guild.id,
+                            guild_name=getattr(guild, "name", None),
+                            category_id=int(cat_obj.id),
+                            category_name=upstream_name,
                         )
                     except Exception:
                         logger.warning(
@@ -3362,12 +3480,28 @@ class ServerReceiver:
                         ch.id,
                         log_str,
                     )
+                    await self._emit_event_log(
+                        "voice_metadata_updated",
+                        f"Updated voice metadata for '{ch.name}': {log_str}",
+                        guild_id=guild.id,
+                        guild_name=getattr(guild, "name", None),
+                        channel_id=ch.id,
+                        channel_name=ch.name,
+                    )
                 elif is_stage_ch and stage_changed_here:
                     logger.info(
                         "[🎭] Updated stage metadata for '%s' #%d: %s",
                         ch.name,
                         ch.id,
                         log_str,
+                    )
+                    await self._emit_event_log(
+                        "stage_metadata_updated",
+                        f"Updated stage metadata for '{ch.name}': {log_str}",
+                        guild_id=guild.id,
+                        guild_name=getattr(guild, "name", None),
+                        channel_id=ch.id,
+                        channel_name=ch.name,
                     )
                 elif is_forum_ch and forum_changed_here:
                     logger.info(
@@ -3376,12 +3510,28 @@ class ServerReceiver:
                         ch.id,
                         log_str,
                     )
+                    await self._emit_event_log(
+                        "forum_metadata_updated",
+                        f"Updated forum metadata for '{ch.name}': {log_str}",
+                        guild_id=guild.id,
+                        guild_name=getattr(guild, "name", None),
+                        channel_id=ch.id,
+                        channel_name=ch.name,
+                    )
                 else:
                     logger.info(
                         "[📝] Updated channel metadata for '%s' #%d: %s",
                         ch.name,
                         ch.id,
                         log_str,
+                    )
+                    await self._emit_event_log(
+                        "channel_metadata_updated",
+                        f"Updated channel metadata for '{ch.name}': {log_str}",
+                        guild_id=guild.id,
+                        guild_name=getattr(guild, "name", None),
+                        channel_id=ch.id,
+                        channel_name=ch.name,
                     )
 
             except Exception as e:
@@ -3477,6 +3627,11 @@ class ServerReceiver:
         if not forums:
             return parts
 
+        channel_name_blacklist = self._get_channel_name_blacklist(
+            host_guild_id or 0,
+            int(guild.id),
+        )
+
         def _cat_name_from_sitemap(cat_id: int | None) -> str | None:
             if not cat_id:
                 return None
@@ -3548,6 +3703,14 @@ class ServerReceiver:
             parent_id = int(f.get("category_id") or 0) or None
             parent_nm = _cat_name_from_sitemap(parent_id) or "Text Channels"
 
+            if _channel_name_blacklisted(name, channel_name_blacklist):
+                logger.debug(
+                    "[🚫] Skipping forum '%s' for clone_g=%s (matches CHANNEL_NAME_BLACKLIST)",
+                    name,
+                    guild.id,
+                )
+                continue
+
             row = per_clone.get(orig_id)
             if row is None:
                 row = self.db.get_channel_mapping_by_original_and_clone(
@@ -3585,6 +3748,16 @@ class ServerReceiver:
                 )
                 logger.info("[➕] Created forum channel '%s' #%d", name, ch.id)
                 created += 1
+                await self._emit_event_log(
+                    "forum_created",
+                    f"Created forum channel '{name}'",
+                    guild_id=guild.id,
+                    guild_name=getattr(guild, "name", None),
+                    channel_id=ch.id,
+                    channel_name=name,
+                    category_id=cloned_parent_id,
+                    category_name=_cat_name_from_sitemap(parent_id),
+                )
 
                 await _ensure_forum_webhook_url(
                     orig_id=orig_id,
@@ -3604,6 +3777,14 @@ class ServerReceiver:
                     await ch.edit(name=name)
                     renamed += 1
                     logger.info("[✏️] Renamed forum #%d to %s", ch.id, name)
+                    await self._emit_event_log(
+                        "forum_renamed",
+                        f"Renamed forum channel to '{name}'",
+                        guild_id=guild.id,
+                        guild_name=getattr(guild, "name", None),
+                        channel_id=ch.id,
+                        channel_name=name,
+                    )
 
                 want_parent = (
                     guild.get_channel(cloned_parent_id) if cloned_parent_id else None
@@ -3617,6 +3798,16 @@ class ServerReceiver:
                         "[📁] Moved forum #%d under category #%d",
                         ch.id,
                         cloned_parent_id,
+                    )
+                    await self._emit_event_log(
+                        "forum_moved",
+                        f"Moved forum '#{ch.name}' under category '{getattr(want_parent, 'name', '?')}'",
+                        guild_id=guild.id,
+                        guild_name=getattr(guild, "name", None),
+                        channel_id=ch.id,
+                        channel_name=getattr(ch, "name", None),
+                        category_id=cloned_parent_id,
+                        category_name=getattr(want_parent, "name", None),
                     )
 
                 await _ensure_forum_webhook_url(
@@ -4031,6 +4222,11 @@ class ServerReceiver:
         clone_stage = settings.get("CLONE_STAGE", False)
         clone_stage_properties = settings.get("CLONE_STAGE_PROPERTIES", False)
 
+        channel_name_blacklist = self._get_channel_name_blacklist(
+            int(host_guild_id) if host_guild_id else 0,
+            int(guild.id),
+        )
+
         has_community = "COMMUNITY" in guild.features
 
         rem = 0
@@ -4050,6 +4246,14 @@ class ServerReceiver:
                 item["parent_name"],
                 item["type"],
             )
+
+            if _channel_name_blacklisted(name, channel_name_blacklist):
+                logger.debug(
+                    "[🚫] Skipping channel '%s' for clone_g=%s (matches CHANNEL_NAME_BLACKLIST)",
+                    name,
+                    guild.id,
+                )
+                continue
 
             per = self.chan_map_by_clone.setdefault(int(guild.id), {})
             mrow = per.get(
@@ -4205,6 +4409,14 @@ class ServerReceiver:
                             ch.name,
                             ch.id,
                         )
+                        await self._emit_event_log(
+                            "channel_converted",
+                            f"Converted channel '{ch.name}' to Announcement",
+                            guild_id=guild.id,
+                            guild_name=getattr(guild, "name", None),
+                            channel_id=ch.id,
+                            channel_name=ch.name,
+                        )
 
                         mrow = per.get(int(orig)) or mrow or {}
                         if not isinstance(mrow, dict):
@@ -4357,6 +4569,14 @@ class ServerReceiver:
                         )
                         await clone_ch.delete()
                         logger.info("[🗑️] Deleted cloned thread %s", clone_id)
+                        await self._emit_event_log(
+                            "thread_deleted",
+                            f"Deleted cloned thread '{thread_name}'",
+                            guild_id=guild.id,
+                            guild_name=getattr(guild, "name", None),
+                            channel_id=clone_id,
+                            channel_name=thread_name,
+                        )
                     self.db.delete_forum_thread_mapping(orig_id)
                     deleted_original_gone += 1
                     continue
@@ -4417,6 +4637,14 @@ class ServerReceiver:
                 )
 
                 logger.info("[✏️] Renamed thread %s: %r → %r", ch.id, old, src["name"])
+                await self._emit_event_log(
+                    "thread_renamed",
+                    f"Renamed thread from '{old}' to '{src['name']}'",
+                    guild_id=guild.id,
+                    guild_name=getattr(guild, "name", None),
+                    channel_id=ch.id,
+                    channel_name=src["name"],
+                )
 
                 renamed += 1
 
@@ -4697,6 +4925,16 @@ class ServerReceiver:
             ch = await guild.create_text_channel(name=name, category=category)
 
         logger.info("[➕] Created %s channel '%s' #%s", kind, name, ch.id)
+        await self._emit_event_log(
+            "channel_created",
+            f"Created {kind} channel '{name}'",
+            guild_id=guild.id,
+            guild_name=getattr(guild, "name", None),
+            channel_id=ch.id,
+            channel_name=name,
+            category_id=getattr(category, "id", None) if category else None,
+            category_name=getattr(category, "name", None) if category else None,
+        )
 
         if kind == "news":
             if "NEWS" in guild.features:
@@ -4706,6 +4944,14 @@ class ServerReceiver:
                     )
                     await ch.edit(type=ChannelType.news)
                     logger.info("[✏️] Converted '%s' #%d to Announcement", name, ch.id)
+                    await self._emit_event_log(
+                        "channel_converted",
+                        f"Converted channel '{name}' to Announcement",
+                        guild_id=guild.id,
+                        guild_name=getattr(guild, "name", None),
+                        channel_id=ch.id,
+                        channel_name=name,
+                    )
                 except HTTPException as e:
                     logger.warning(
                         "[⚠️] Could not convert '%s' to Announcement in guild %s: %s; left as text",
@@ -4813,9 +5059,25 @@ class ServerReceiver:
                 logger.info(
                     "[📌] Enforced pinned name on #%d: %r → %r", ch.id, old_name, target
                 )
+                await self._emit_event_log(
+                    "channel_renamed",
+                    f"Enforced pinned name: '{old_name}' → '{target}'",
+                    guild_id=ch.guild.id,
+                    guild_name=getattr(ch.guild, "name", None),
+                    channel_id=ch.id,
+                    channel_name=target,
+                )
                 return True, "pinned_enforced"
             else:
                 logger.info("[✏️] Renamed channel #%d: %r → %r", ch.id, old_name, target)
+                await self._emit_event_log(
+                    "channel_renamed",
+                    f"Renamed channel: '{old_name}' → '{target}'",
+                    guild_id=ch.guild.id,
+                    guild_name=getattr(ch.guild, "name", None),
+                    channel_id=ch.id,
+                    channel_name=target,
+                )
                 return True, "match_upstream"
 
         except Exception:
@@ -4898,6 +5160,16 @@ class ServerReceiver:
                                 getattr(ch, "name", ch.id),
                                 getattr(clone_cat, "name", clone_cat.id),
                             )
+                            await self._emit_event_log(
+                                "channel_deleted",
+                                f"Deleted channel '#{getattr(ch, 'name', ch.id)}' (category '{getattr(clone_cat, 'name', clone_cat.id)}' removed)",
+                                guild_id=guild.id,
+                                guild_name=getattr(guild, "name", None),
+                                channel_id=getattr(ch, "id", None),
+                                channel_name=getattr(ch, "name", None),
+                                category_id=clone_cat_id,
+                                category_name=getattr(clone_cat, "name", None),
+                            )
                         except Exception:
                             logger.debug(
                                 "Failed to delete channel %s under category %s",
@@ -4923,6 +5195,14 @@ class ServerReceiver:
                         getattr(clone_cat, "name", clone_cat_id),
                         clone_cat_id,
                         guild.id,
+                    )
+                    await self._emit_event_log(
+                        "category_deleted",
+                        f"Deleted category '{getattr(clone_cat, 'name', clone_cat_id)}'",
+                        guild_id=guild.id,
+                        guild_name=getattr(guild, "name", None),
+                        category_id=clone_cat_id,
+                        category_name=getattr(clone_cat, "name", None),
                     )
                 except Exception:
                     logger.debug(
@@ -5083,6 +5363,14 @@ class ServerReceiver:
                     try:
                         await ch.delete()
                         logger.info("[🗑️] Deleted channel #%s (%d)", ch.name, ch.id)
+                        await self._emit_event_log(
+                            "channel_deleted",
+                            f"Deleted channel '#{ch.name}'",
+                            guild_id=guild.id,
+                            guild_name=getattr(guild, "name", None),
+                            channel_id=ch.id,
+                            channel_name=getattr(ch, "name", None),
+                        )
                         deleted_here = True
                     except discord.HTTPException as e:
 
@@ -5196,6 +5484,14 @@ class ServerReceiver:
             )
 
             logger.info("[📌] Renamed category %r → %r", current, desired)
+            await self._emit_event_log(
+                "category_renamed",
+                f"Renamed category: '{current}' → '{desired}'",
+                guild_id=cat.guild.id,
+                guild_name=getattr(cat.guild, "name", None),
+                category_id=cat.id,
+                category_name=desired,
+            )
 
             try:
                 self.db.upsert_category_mapping(
@@ -5311,6 +5607,14 @@ class ServerReceiver:
         await self.ratelimit.acquire_for_guild(ActionType.CREATE_CHANNEL, guild.id)
         cat = await guild.create_category(name)
         logger.info("[➕] Created category '%s' #%d", name, cat.id)
+        await self._emit_event_log(
+            "category_created",
+            f"Created category '{name}'",
+            guild_id=guild.id,
+            guild_name=getattr(guild, "name", None),
+            category_id=int(cat.id),
+            category_name=name,
+        )
 
         self.db.upsert_category_mapping(
             orig_id=original_id,
@@ -5349,6 +5653,14 @@ class ServerReceiver:
                 pass
             webhook = await ch.create_webhook(name=name, avatar=avatar_bytes)
             logger.info("[➕] Created webhook '%s' in channel #%s", name, ch.id)
+            await self._emit_event_log(
+                "webhook_created",
+                f"Created webhook in #{getattr(ch, 'name', ch.id)}",
+                guild_id=ch.guild.id,
+                guild_name=getattr(ch.guild, "name", None),
+                channel_id=ch.id,
+                channel_name=getattr(ch, "name", None),
+            )
             if hasattr(self, "_wh_meta"):
                 self._wh_meta.clear()
             return webhook
@@ -5602,6 +5914,16 @@ class ServerReceiver:
                     int(ch.id),
                     old_name,
                     new_name,
+                )
+                await self._emit_event_log(
+                    "channel_moved",
+                    f"Moved channel '{getattr(ch, 'name', '?')}' from '{old_name}' to '{new_name}'",
+                    guild_id=guild.id,
+                    guild_name=getattr(guild, "name", None),
+                    channel_id=ch.id,
+                    channel_name=getattr(ch, "name", None),
+                    category_id=desired_parent_clone_id,
+                    category_name=getattr(desired_parent, "name", None),
                 )
             except Exception:
                 logger.warning(
@@ -5961,6 +6283,14 @@ class ServerReceiver:
                         clone_gid,
                         getattr(getattr(t, "parent", None), "id", None),
                     )
+                    await self._emit_event_log(
+                        "thread_deleted",
+                        f"Deleted cloned thread '{getattr(t, 'name', cloned_tid)}'",
+                        guild_id=clone_gid,
+                        guild_name=getattr(g, "name", None),
+                        channel_id=cloned_tid,
+                        channel_name=getattr(t, "name", None),
+                    )
                 else:
                     logger.debug(
                         "[threads] delete: cloned thread not found (gid=%s tid=%s) — will drop mapping",
@@ -6080,6 +6410,14 @@ class ServerReceiver:
                     (ch.parent.name if getattr(ch, "parent", None) else "Unknown"),
                     old_name,
                     new_name,
+                )
+                await self._emit_event_log(
+                    "thread_renamed",
+                    f"Renamed thread from '{old_name}' to '{new_name}'",
+                    guild_id=clone_gid,
+                    guild_name=getattr(guild, "name", None),
+                    channel_id=cloned_id,
+                    channel_name=new_name,
                 )
             except Exception as e:
                 logger.error(
@@ -6230,7 +6568,6 @@ class ServerReceiver:
                     continue
 
         return text, embeds
-
 
     def _sanitize_inline(
         self,
@@ -7859,10 +8196,25 @@ class ServerReceiver:
                         )
                         continue
 
-                    try:
-                        orig_gid = int(
-                            mapping.get("original_guild_id") or host_guild_id or 0
+                    orig_gid = int(
+                        mapping.get("original_guild_id") or host_guild_id or 0
+                    )
+
+                    _fwd_blacklist = self._get_channel_name_blacklist(
+                        orig_gid, clone_gid
+                    )
+                    if _channel_name_blacklisted(
+                        msg.get("channel_name") or "", _fwd_blacklist
+                    ):
+                        logger.debug(
+                            "[forward] Skipping clone %s for src #%s — channel '%s' matches CHANNEL_NAME_BLACKLIST",
+                            mapping.get("cloned_guild_id"),
+                            source_id,
+                            msg.get("channel_name"),
                         )
+                        continue
+
+                    try:
                         content_to_check = msg.get("content", "") or ""
 
                         should_block, blocked_keyword = self._should_block_for_mapping(
@@ -8299,8 +8651,10 @@ class ServerReceiver:
                     original_guild_id=host_gid,
                     cloned_guild_id=clone_gid,
                 )
-                if settings.get("ENABLE_CLONING", True) and settings.get(
-                    "EDIT_MESSAGES", True
+                if (
+                    settings.get("ENABLE_CLONING", True)
+                    and settings.get("EDIT_MESSAGES", True)
+                    and settings.get("RESEND_EDITED_MESSAGES", True)
                 ):
                     allowed.add(clone_gid)
             except Exception:
@@ -8308,7 +8662,7 @@ class ServerReceiver:
 
         if not allowed:
             logger.info(
-                "[✏️] Fallback edit skipped for channel %s (no clones allow EDIT_MESSAGES)",
+                "[✏️] Edited message not resent — EDIT_MESSAGES or RESEND_EDITED_MESSAGES is disabled for all clones of channel %s",
                 source_id,
             )
             return
@@ -8398,9 +8752,10 @@ class ServerReceiver:
                 edited_any = edited_any or ok
             if not edited_any:
                 logger.debug(
-                    "[✏️] No edits performed for orig %s (all disabled or failed).",
+                    "[✏️] No edits performed for orig %s (all disabled or failed). Attempting resend.",
                     orig_mid,
                 )
+                await self._fallback_resend_edit(payload, orig_mid)
             return
 
         ev = self._inflight_events.get(orig_mid)
@@ -9716,6 +10071,16 @@ class ServerReceiver:
                                 cloned_guild_id=int(guild.id),
                             )
 
+                            if created:
+                                await self._emit_event_log(
+                                    "thread_created",
+                                    f"Created thread '{data['thread_name']}' in #{getattr(cloned_parent, 'name', cloned_id)}",
+                                    guild_id=guild.id,
+                                    guild_name=getattr(guild, "name", None),
+                                    channel_id=new_id,
+                                    channel_name=data["thread_name"],
+                                )
+
                         if not created and clone_thread is not None:
                             meta = await self._get_webhook_meta(parent_id, webhook_url)
 
@@ -10832,6 +11197,53 @@ class ServerReceiver:
         key_global = (0, 0)
         patterns.extend(self._blocked_keywords_cache.get(key_global, []))
 
+        return patterns
+
+    async def _load_channel_name_blacklist_cache(self) -> None:
+        async with self._channel_name_blacklist_lock:
+            self._channel_name_blacklist_cache.clear()
+
+            logger.debug("[chan-blacklist] Loading channel name blacklist from database...")
+
+            try:
+                rows = self.db.conn.execute(
+                    """
+                    SELECT pattern, original_guild_id, cloned_guild_id
+                    FROM channel_name_blacklist
+                    ORDER BY original_guild_id, cloned_guild_id, pattern
+                    """
+                ).fetchall()
+            except Exception:
+                logger.exception("[chan-blacklist] Failed to load from DB")
+                return
+
+            if not rows:
+                logger.debug("[chan-blacklist] No patterns found in database")
+                return
+
+            for row in rows:
+                pattern = (row["pattern"] or "").strip().lower()
+                if not pattern:
+                    continue
+
+                orig_gid = int(row["original_guild_id"] or 0)
+                clone_gid = int(row["cloned_guild_id"] or 0)
+
+                key = (orig_gid, clone_gid)
+                self._channel_name_blacklist_cache.setdefault(key, []).append(pattern)
+
+            logger.debug(
+                "[chan-blacklist] Loaded %d patterns across %d mapping scopes",
+                sum(len(v) for v in self._channel_name_blacklist_cache.values()),
+                len(self._channel_name_blacklist_cache),
+            )
+
+    def _get_channel_name_blacklist(
+        self, original_guild_id: int, cloned_guild_id: int
+    ) -> list[str]:
+        patterns: list[str] = []
+        key = (int(original_guild_id), int(cloned_guild_id))
+        patterns.extend(self._channel_name_blacklist_cache.get(key, []))
         return patterns
 
     async def _load_word_rewrites_cache(self) -> None:

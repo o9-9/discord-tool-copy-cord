@@ -184,6 +184,7 @@
     DELETE_THREADS: true,
     DELETE_MESSAGES: true,
     EDIT_MESSAGES: true,
+    RESEND_EDITED_MESSAGES: true,
     REPOSITION_CHANNELS: true,
     DELETE_ROLES: true,
     UPDATE_ROLES: true,
@@ -1587,6 +1588,7 @@
       ["ex_categories", "ex_categories", "ids"],
       ["ex_channels", "ex_channels", "ids"],
       ["blocked_words", "blocked_words", "words"],
+      ["channel_name_blacklist", "channel_name_blacklist", "words"],
       ["cmd_users", "COMMAND_USERS", "ids"],
       ["blocked_roles", "blocked_role_ids", "ids"],
       ["wl_users", "wl_users", "ids"],
@@ -3902,6 +3904,7 @@
 
     const wlUsers = document.getElementById("wl_users");
     const blUsers = document.getElementById("bl_users");
+    const chanBl = document.getElementById("channel_name_blacklist");
 
     if (wlCats) wlCats.value = "";
     if (wlCh) wlCh.value = "";
@@ -3911,12 +3914,14 @@
     if (hiddenBlockedRoles) hiddenBlockedRoles.value = "";
     if (wlUsers) wlUsers.value = "";
     if (blUsers) blUsers.value = "";
+    if (chanBl) chanBl.value = "";
 
     if (CHIPS.wl_categories) CHIPS.wl_categories.set([]);
     if (CHIPS.wl_channels) CHIPS.wl_channels.set([]);
     if (CHIPS.ex_categories) CHIPS.ex_categories.set([]);
     if (CHIPS.ex_channels) CHIPS.ex_channels.set([]);
     if (CHIPS.blocked_words) CHIPS.blocked_words.set([]);
+    if (CHIPS.channel_name_blacklist) CHIPS.channel_name_blacklist.set([]);
     if (CHIPS.blocked_roles) CHIPS.blocked_roles.set([]);
     if (CHIPS.wl_users) CHIPS.wl_users.set([]);
     if (CHIPS.bl_users) CHIPS.bl_users.set([]);
@@ -3947,6 +3952,9 @@
         }
         if (Array.isArray(data.blocked_words) && CHIPS.blocked_words) {
           CHIPS.blocked_words.set(data.blocked_words);
+        }
+        if (Array.isArray(data.channel_name_blacklist) && CHIPS.channel_name_blacklist) {
+          CHIPS.channel_name_blacklist.set(data.channel_name_blacklist);
         }
 
         let roleIds = [];
@@ -4722,6 +4730,125 @@
     }
 
     refreshGuildMappings();
+
+    // ─── Server Proxy Rotation ─────────────────────────────────────────────
+    const srvProxyCard    = document.getElementById("srv-proxy-card");
+    const srvProxyToggle  = document.getElementById("srv-proxy-toggle");
+    const srvProxyTa      = document.getElementById("srv-proxy-textarea");
+    const srvProxyCount   = document.getElementById("srv-proxy-count");
+    const srvProxyStatus  = document.getElementById("srv-proxy-status");
+    const srvProxySave    = document.getElementById("srv-proxy-save");
+    const srvProxyClear   = document.getElementById("srv-proxy-clear");
+    const srvPrependHttp  = document.getElementById("srv-proxy-prepend-http");
+    const srvPrependSocks = document.getElementById("srv-proxy-prepend-socks5");
+
+    function srvProxyLines() {
+      if (!srvProxyTa) return [];
+      return srvProxyTa.value.split("\n").map(l => l.trim()).filter(Boolean);
+    }
+
+    function updateSrvProxyCount() {
+      if (!srvProxyCount) return;
+      const n = srvProxyLines().length;
+      srvProxyCount.textContent = n > 0 ? `${n} proxy${n !== 1 ? "ies" : ""}` : "";
+    }
+
+    function updateSrvProxyStatus(enabled, count) {
+      if (!srvProxyStatus) return;
+      if (enabled && count > 0) {
+        srvProxyStatus.textContent = `Enabled · ${count} proxy${count !== 1 ? "ies" : ""}`;
+        srvProxyStatus.className = "srv-proxy-status is-on";
+      } else if (enabled) {
+        srvProxyStatus.textContent = "Enabled · no proxies loaded";
+        srvProxyStatus.className = "srv-proxy-status is-warn";
+      } else {
+        srvProxyStatus.textContent = "Disabled";
+        srvProxyStatus.className = "srv-proxy-status";
+      }
+    }
+
+    async function loadSrvProxies() {
+      if (!srvProxyCard) return;
+      try {
+        const r = await fetch("/api/server/proxies");
+        const j = await r.json();
+        if (j.ok) {
+          if (srvProxyTa) srvProxyTa.value = (j.proxies || []).join("\n");
+          if (srvProxyToggle) srvProxyToggle.checked = !!j.enabled;
+          updateSrvProxyCount();
+          updateSrvProxyStatus(!!j.enabled, (j.proxies || []).length);
+        }
+      } catch (e) {
+        console.error("Failed to load server proxies:", e);
+      }
+    }
+
+    async function saveSrvProxies() {
+      const lines = srvProxyLines();
+      try {
+        const r = await fetch("/api/server/proxies", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ proxies: lines }),
+        });
+        const j = await r.json();
+        if (j.ok) {
+          showToast(`Saved ${lines.length} server prox${lines.length !== 1 ? "ies" : "y"}`, { type: "success" });
+          updateSrvProxyCount();
+          updateSrvProxyStatus(srvProxyToggle?.checked, lines.length);
+        } else {
+          showToast(j.error || "Failed to save proxies", { type: "error" });
+        }
+      } catch (e) {
+        console.error(e);
+        showToast("Failed to save proxies", { type: "error" });
+      }
+    }
+
+    async function toggleSrvProxies(enabled) {
+      try {
+        const r = await fetch("/api/server/proxies/toggle", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled }),
+        });
+        const j = await r.json();
+        if (j.ok) {
+          const count = srvProxyLines().length;
+          showToast(
+            enabled
+              ? `Proxy rotation enabled (${count} prox${count !== 1 ? "ies" : "y"})`
+              : "Proxy rotation disabled",
+            { type: "success" }
+          );
+          updateSrvProxyStatus(enabled, count);
+        } else {
+          showToast(j.error || "Failed to toggle", { type: "error" });
+        }
+      } catch (e) {
+        console.error(e);
+        showToast("Failed to toggle proxy rotation", { type: "error" });
+      }
+    }
+
+    function srvPrependScheme(scheme) {
+      if (!srvProxyTa) return;
+      srvProxyTa.value = srvProxyTa.value.split("\n").map(line => {
+        const l = line.trim();
+        if (!l || l.includes("://")) return line;
+        return `${scheme}${l}`;
+      }).join("\n");
+      updateSrvProxyCount();
+    }
+
+    if (srvProxySave)    srvProxySave.addEventListener("click", () => saveSrvProxies());
+    if (srvProxyClear)   srvProxyClear.addEventListener("click", async () => { if (srvProxyTa) srvProxyTa.value = ""; await saveSrvProxies(); });
+    if (srvProxyTa)      srvProxyTa.addEventListener("input", updateSrvProxyCount);
+    if (srvProxyToggle)  srvProxyToggle.addEventListener("change", () => toggleSrvProxies(srvProxyToggle.checked));
+    if (srvPrependHttp)  srvPrependHttp.addEventListener("click", () => srvPrependScheme("http://"));
+    if (srvPrependSocks) srvPrependSocks.addEventListener("click", () => srvPrependScheme("socks5://"));
+
+    loadSrvProxies();
   });
 
   ["server", "client"].forEach((role) => {

@@ -118,6 +118,97 @@ def _clip(s: str, limit: int) -> str:
     return s if len(s) <= limit else (s[: limit - 3] + "...")
 
 
+def _sanitize_discord_embed_for_webhook(e: dict) -> dict | None:
+    """
+    Keep only fields that Discord webhooks accept for outgoing embeds.
+    Drops keys that are commonly present in incoming embeds but not useful/accepted.
+    """
+    if not isinstance(e, dict):
+        return None
+
+    out: dict = {}
+
+    def _str(v: object) -> str | None:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s if s else None
+
+    for k in ("title", "description", "url", "timestamp"):
+        v = _str(e.get(k))
+        if v:
+            out[k] = v
+
+    c = e.get("color")
+    if isinstance(c, int):
+        out["color"] = c
+
+    footer = e.get("footer")
+    if isinstance(footer, dict):
+        ft = _str(footer.get("text"))
+        fi = _str(footer.get("icon_url"))
+        if ft or fi:
+            out["footer"] = {}
+            if ft:
+                out["footer"]["text"] = ft
+            if fi:
+                out["footer"]["icon_url"] = fi
+
+    author = e.get("author")
+    if isinstance(author, dict):
+        an = _str(author.get("name"))
+        au = _str(author.get("url"))
+        ai = _str(author.get("icon_url"))
+        if an or au or ai:
+            out["author"] = {}
+            if an:
+                out["author"]["name"] = an
+            if au:
+                out["author"]["url"] = au
+            if ai:
+                out["author"]["icon_url"] = ai
+
+    for k in ("image", "thumbnail"):
+        obj = e.get(k)
+        if isinstance(obj, dict):
+            u = _str(obj.get("url"))
+            if u:
+                out[k] = {"url": u}
+
+    fields_in = e.get("fields")
+    if isinstance(fields_in, list):
+        fields_out: list[dict] = []
+        for f in fields_in:
+            if not isinstance(f, dict):
+                continue
+            n = _str(f.get("name"))
+            v = _str(f.get("value"))
+            if not (n and v):
+                continue
+            fo = {"name": n, "value": v}
+            if isinstance(f.get("inline"), bool):
+                fo["inline"] = f["inline"]
+            fields_out.append(fo)
+        if fields_out:
+            out["fields"] = fields_out
+
+    return out or None
+
+
+def _extract_embed_image_urls(embeds: list[dict]) -> set[str]:
+    urls: set[str] = set()
+    for e in embeds or []:
+        if not isinstance(e, dict):
+            continue
+        for k in ("image", "thumbnail"):
+            obj = e.get(k)
+            if isinstance(obj, dict):
+                u = (obj.get("url") or "").strip()
+                if u:
+                    urls.add(u)
+    return urls
+
+
 @dataclass
 class ForwardingFilters:
     include_channels: list[int]
@@ -262,10 +353,28 @@ class ForwardingFilters:
         content = attrs.get("content") or ""
         if self.include_embeds:
             for e in attrs.get("embeds") or []:
-                if isinstance(e, dict):
-                    desc = e.get("description") or ""
-                    if desc:
-                        content += "\n" + desc
+                if not isinstance(e, dict):
+                    continue
+
+                title = (e.get("title") or "").strip()
+                desc = (e.get("description") or "").strip()
+
+                if title:
+                    content += "\n" + title
+                if desc:
+                    content += "\n" + desc
+
+                for f in e.get("fields") or []:
+                    if not isinstance(f, dict):
+                        continue
+                    n = (f.get("name") or "").strip()
+                    v = (f.get("value") or "").strip()
+                    if n and v:
+                        content += f"\n{n}: {v}"
+                    elif n:
+                        content += "\n" + n
+                    elif v:
+                        content += "\n" + v
 
         attachments = attrs.get("attachments") or []
         for att in attachments:
@@ -374,6 +483,10 @@ class ForwardingManager:
         self._queue_maxsize = int(os.getenv("FORWARDING_QUEUE_MAXSIZE", "2000"))
         self._max_attempts = int(os.getenv("FORWARDING_QUEUE_MAX_ATTEMPTS", "3"))
         self._retry_max_delay = float(os.getenv("FORWARDING_RETRY_MAX_DELAY", "60"))
+
+        self._dedup_ttl = float(os.getenv("FORWARDING_DEDUP_TTL", "60"))
+        self._dedup_cache: Dict[tuple, float] = {}
+        self._dedup_max_size = 10_000
 
         self._workers_per_provider: Dict[str, int] = {
             "telegram": int(os.getenv("FORWARDING_WORKERS_TELEGRAM", "1")),
@@ -795,6 +908,30 @@ class ForwardingManager:
             "jump_url": jump_url,
         }
 
+    def _dedup_seen(self, message_id: Any, rule_id: str) -> float | None:
+        """Return the age in seconds of the existing entry, or None if not seen."""
+        now = time.monotonic()
+        key = (message_id, rule_id)
+
+        # Evict expired entries when cache is large
+        if len(self._dedup_cache) >= self._dedup_max_size:
+            expired = [k for k, ts in self._dedup_cache.items() if now - ts > self._dedup_ttl]
+            for k in expired:
+                del self._dedup_cache[k]
+
+        ts = self._dedup_cache.get(key)
+        if ts is not None and now - ts < self._dedup_ttl:
+            return now - ts
+
+        self._dedup_cache[key] = now
+        return None
+
+    def _dedup_touch(self, message_id: Any, rule_id: str) -> None:
+        """Refresh the dedup timestamp so the entry stays alive while a job is in-flight."""
+        key = (message_id, rule_id)
+        if key in self._dedup_cache:
+            self._dedup_cache[key] = time.monotonic()
+
     async def _dispatch_forwarding(self, rule: ForwardingRule, attrs: dict) -> None:
         if self._closing:
             return
@@ -804,6 +941,17 @@ class ForwardingManager:
             return
 
         msg_id = attrs.get("message_id") or "message"
+
+        if msg_id and msg_id != "message":
+            dedup_age = self._dedup_seen(msg_id, rule.rule_id)
+            if dedup_age is not None:
+                self.log.warning(
+                    "[⏩] Dedup blocked duplicate | rule_id=%s message_id=%s age=%.1fs",
+                    rule.rule_id,
+                    msg_id,
+                    dedup_age,
+                )
+                return
         job = ForwardingJob(
             provider_queue=queue_name,
             rule=rule,
@@ -929,7 +1077,8 @@ class ForwardingManager:
             return
         if provider == "discord":
             await self._send_discord_webhook(
-                rule=job.rule, attrs=job.attrs, session=session
+                rule=job.rule, attrs=job.attrs, session=session,
+                attempt=job.attempts,
             )
             return
 
@@ -975,6 +1124,7 @@ class ForwardingManager:
             delay,
         )
 
+        self._dedup_touch(job.message_id, job.rule.rule_id)
         asyncio.create_task(self._requeue_later(provider, job, delay))
 
     async def _requeue_later(
@@ -984,6 +1134,7 @@ class ForwardingManager:
             await asyncio.sleep(max(0.0, float(delay)))
             if self._closing:
                 return
+            self._dedup_touch(job.message_id, job.rule.rule_id)
             q = self._queues.get(provider)
             if not q:
                 return
@@ -1549,7 +1700,6 @@ class ForwardingManager:
                     body=body_txt,
                 )
 
-            # handle Telegram's ok=false even when status is 200
             if status != 200 or (isinstance(data, dict) and data.get("ok") is False):
                 self.log.warning(
                     "[⏩] %s failed | status=%s body=%s",
@@ -1695,6 +1845,7 @@ class ForwardingManager:
         rule: ForwardingRule,
         attrs: dict,
         session: aiohttp.ClientSession,
+        attempt: int = 0,
     ) -> None:
         url = (rule.config.get("url") or "").strip()
         if not url:
@@ -1710,9 +1861,6 @@ class ForwardingManager:
             return
 
         content = (attrs.get("content") or "").strip()
-
-        image_urls = self._extract_image_urls(attrs)
-        embeds = [{"image": {"url": u}} for u in image_urls[:10]]
 
         non_image_links: list[str] = []
         for a in attrs.get("attachments") or []:
@@ -1737,16 +1885,45 @@ class ForwardingManager:
 
         text = _clip("\n".join(lines).strip(), 2000)
 
+        raw_embeds = [e for e in (attrs.get("embeds") or []) if isinstance(e, dict)]
+        forwarded_embeds: list[dict] = []
+        for e in raw_embeds:
+            se = _sanitize_discord_embed_for_webhook(e)
+            if se:
+                forwarded_embeds.append(se)
+
+        forwarded_embeds = forwarded_embeds[:10]
+
+        existing_img_urls = _extract_embed_image_urls(forwarded_embeds)
+
+        att_image_urls: list[str] = []
+        for a in attrs.get("attachments") or []:
+            if not isinstance(a, dict):
+                continue
+            if not self._is_image_att(a):
+                continue
+            u = (a.get("url") or "").strip()
+            if u and u not in existing_img_urls:
+                att_image_urls.append(u)
+
+        remaining = max(0, 10 - len(forwarded_embeds))
+        if remaining > 0 and att_image_urls:
+            forwarded_embeds.extend(
+                {"image": {"url": u}} for u in att_image_urls[:remaining]
+            )
+
         payload = {
-            "embeds": embeds,
             "allowed_mentions": {"parse": []},
         }
 
         if text:
             payload["content"] = text
-        else:
-            if not embeds:
-                payload["content"] = "New message"
+
+        if forwarded_embeds:
+            payload["embeds"] = forwarded_embeds
+
+        if not payload.get("content") and not payload.get("embeds"):
+            payload["content"] = "New message"
 
         uname = (
             (rule.config.get("username") or "")
@@ -1771,7 +1948,28 @@ class ForwardingManager:
                     rule.rule_id,
                 )
 
-        status, body, retry_after = await _post_with_discord_429_retry(session, url, payload)
+        msg_id = attrs.get("message_id")
+        if msg_id and self.db:
+            try:
+                if self.db.has_forwarding_event(
+                    rule_id=rule.rule_id,
+                    source_message_id=int(msg_id),
+                ):
+                    self.log.warning(
+                        "[⏩] DB dedup blocked duplicate webhook | rule_id=%s label=%s message_id=%s channel=%s attempt=%s",
+                        rule.rule_id,
+                        rule.label,
+                        msg_id,
+                        attrs.get("channel_name"),
+                        attempt,
+                    )
+                    return
+            except Exception:
+                self.log.debug("[⏩] DB dedup check failed, proceeding", exc_info=True)
+
+        status, body, retry_after = await _post_with_discord_429_retry(
+            session, url, payload
+        )
 
         if status == 429:
             raise RetryableForwardingError(
@@ -1796,7 +1994,14 @@ class ForwardingManager:
             )
             return
 
-        self.log.info("[⏩] Discord webhook forward OK")
+        self.log.info(
+            "[⏩] Discord webhook forward OK | rule_id=%s label=%s message_id=%s channel=%s attempt=%s",
+            rule.rule_id,
+            rule.label,
+            attrs.get("message_id"),
+            attrs.get("channel_name"),
+            attempt,
+        )
         try:
             self.db.record_forwarding_event(
                 provider="discord",
@@ -1808,7 +2013,6 @@ class ForwardingManager:
             )
         except Exception:
             self.log.debug("[⏩] failed to record discord webhook event", exc_info=True)
-
 
 
 async def _post_with_discord_429_retry(
